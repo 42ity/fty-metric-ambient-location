@@ -626,7 +626,7 @@ void fty_ambient_location_server(zsock_t* pipe, void* /*args*/)
             if (!msg)
                 break;
 
-            if (!is_fty_proto(msg)) {
+            if (!fty_proto_is(msg)) {
                 zmsg_destroy(&msg);
                 continue;
             } else {
