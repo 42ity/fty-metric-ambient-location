@@ -216,26 +216,22 @@ static bool s_get_value(AmbientLocation* self, std::string name, int typeMetric,
     }
 
     // it's a sensor
-    fty::shm::shmMetrics metrics;
     fty_proto_t* sensor_value = nullptr;
-    if (typeMetric == AMBIENT_LOCATION_TYPE_HUMIDITY) {
-        fty::shm::read_metrics(name, "humidity.default", metrics);
-        if (metrics.size() == 1) {
-            sensor_value = metrics.get(0);
-        }
-    } else { // assume temperature
-        fty::shm::read_metrics(name, "temperature.default", metrics);
-        if (metrics.size() == 1) {
-            sensor_value = metrics.get(0);
-        }
+    const char* metricName = (typeMetric == AMBIENT_LOCATION_TYPE_HUMIDITY) ? "humidity.default" : "temperature.default";
+    if (fty::shm::read_metric(name, metricName, &sensor_value) != 0) {
+        fty_proto_destroy(&sensor_value);
+        log_error("s_get_value: Error when read %s for %s", metricName, name.c_str());
+        return false;
     }
     if (!sensor_value) { // no metric in cache
+        fty_proto_destroy(&sensor_value);
         return true;
     }
 
     time_t valid_till = time_t(fty_proto_time(sensor_value) + fty_proto_ttl(sensor_value));
     if (time(nullptr) > valid_till) {
         // the metric is too old
+        fty_proto_destroy(&sensor_value);
         return true;
     }
 
@@ -250,6 +246,7 @@ static bool s_get_value(AmbientLocation* self, std::string name, int typeMetric,
         if (errno == ERANGE || end == value || *end != '\0') {
             log_info("cannot convert value '%s' to double, ignore message", value);
             fty_proto_print(sensor_value);
+            fty_proto_destroy(&sensor_value);
             return true;
         }
     }
@@ -275,7 +272,7 @@ static bool s_get_value(AmbientLocation* self, std::string name, int typeMetric,
             result.out_temperature.ttl   = int(fty_proto_ttl(sensor_value));
         }
     }
-
+    fty_proto_destroy(&sensor_value);
     return true;
 }
 

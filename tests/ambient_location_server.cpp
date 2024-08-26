@@ -74,8 +74,8 @@ TEST_CASE("ambient location server test")
     int         rv      = mlm_client_send(producer, subject, &msg);
     REQUIRE(rv == 0);
 
-    if (aux) zhash_destroy(&aux);
-    if (ext) zhash_destroy(&ext);
+    zhash_destroy(&aux);
+    zhash_destroy(&ext);
 
     aux = zhash_new();
     zhash_autofree(aux);
