@@ -223,10 +223,6 @@ static bool s_get_value(AmbientLocation* self, std::string name, int typeMetric,
         log_error("s_get_value: Error when read %s for %s", metricName, name.c_str());
         return false;
     }
-    if (!sensor_value) { // no metric in cache
-        fty_proto_destroy(&sensor_value);
-        return true;
-    }
 
     time_t valid_till = time_t(fty_proto_time(sensor_value) + fty_proto_ttl(sensor_value));
     if (time(nullptr) > valid_till) {
