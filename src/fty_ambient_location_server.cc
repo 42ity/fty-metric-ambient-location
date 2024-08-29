@@ -54,7 +54,6 @@ static std::mutex mtx_ambient_hashmap;
 
 //fwd decl.
 class AmbientLocation;
-static void s_remove_from_cache(AmbientLocation* self, std::string name, int type);
 static void s_ambient_location_calculation(zsock_t* pipe, void* args);
 
 // our class
@@ -79,14 +78,11 @@ public:
     ~AmbientLocation() {
         zactor_destroy(&ambient_calculation);
         mlm_client_destroy(&client);
-        for (auto& sensor : cache) {
-            s_remove_from_cache(this, sensor.first, AMBIENT_LOCATION_TYPE_BOTH);
-        }
     }
 
     using Containers     = std::unordered_map<std::string, std::string>;
     using ContainersList = std::unordered_map<std::string, std::vector<std::string>>;
-    using Cache       = std::unordered_map<std::string, std::pair<std::string, std::pair<fty_proto_t*, fty_proto_t*>>>;
+    using Cache       = std::unordered_map<std::string, std::string>; // [sensor_name (e.g. sensor-73758544), sensor_function (input or ouput)]
     using Datacenters = std::vector<std::string>;
 
     mlm_client_t*  client{nullptr};
@@ -178,25 +174,6 @@ static int s_handle_actor_commands(AmbientLocation* self, zmsg_t** message_p)
     return ret; // 0: ok, 1: $TERM
 }
 
-static void s_remove_from_cache(AmbientLocation* self, std::string name, int type)
-{
-    assert(self);
-    log_debug("remove from cache (%s, type: %d)", name.c_str(), type);
-
-    auto it = self->cache.find(name);
-    if (it == self->cache.end()) {
-        log_debug("%s not found in cache", name.c_str());
-        return;
-    }
-
-    if (type == AMBIENT_LOCATION_TYPE_HUMIDITY || type == AMBIENT_LOCATION_TYPE_BOTH) {
-        fty_proto_destroy(&(it->second.second.first));
-    }
-    if (type == AMBIENT_LOCATION_TYPE_TEMP || type == AMBIENT_LOCATION_TYPE_BOTH) {
-        fty_proto_destroy(&(it->second.second.second));
-    }
-}
-
 static void s_publish_value(const std::string& type, const std::string& unit, const std::string& name, double value, int ttl)
 {
     fty_proto_t* n_met = fty_proto_new(FTY_PROTO_METRIC);
@@ -230,7 +207,7 @@ static void s_publish_value(const std::string& type, const std::string& unit, co
 }
 
 // return false if name is not in cache
-static bool s_get_cache_value(AmbientLocation* self, std::string name, int typeMetric, ambient_values_t& result)
+static bool s_get_value(AmbientLocation* self, std::string name, int typeMetric, ambient_values_t& result)
 {
     assert(self);
     auto sensor = self->cache.find(name);
@@ -240,19 +217,17 @@ static bool s_get_cache_value(AmbientLocation* self, std::string name, int typeM
 
     // it's a sensor
     fty_proto_t* sensor_value = nullptr;
-    if (typeMetric == AMBIENT_LOCATION_TYPE_HUMIDITY) {
-        sensor_value = sensor->second.second.first;
-    } else { // assume temperature
-        sensor_value = sensor->second.second.second;
-    }
-    if (!sensor_value) { // no metric in cache
-        return true;
+    const char* metricName = (typeMetric == AMBIENT_LOCATION_TYPE_HUMIDITY) ? "humidity.default" : "temperature.default";
+    if (fty::shm::read_metric(name, metricName, &sensor_value) != 0) {
+        fty_proto_destroy(&sensor_value);
+        log_error("s_get_value: Error when read %s for %s", metricName, name.c_str());
+        return false;
     }
 
     time_t valid_till = time_t(fty_proto_time(sensor_value) + fty_proto_ttl(sensor_value));
     if (time(nullptr) > valid_till) {
         // the metric is too old
-        s_remove_from_cache(self, name, typeMetric);
+        fty_proto_destroy(&sensor_value);
         return true;
     }
 
@@ -267,11 +242,12 @@ static bool s_get_cache_value(AmbientLocation* self, std::string name, int typeM
         if (errno == ERANGE || end == value || *end != '\0') {
             log_info("cannot convert value '%s' to double, ignore message", value);
             fty_proto_print(sensor_value);
+            fty_proto_destroy(&sensor_value);
             return true;
         }
     }
 
-    std::string sensor_function = sensor->second.first;
+    std::string sensor_function = sensor->second;
     log_trace("%s: sensor_function='%s'", name.c_str(), sensor_function.c_str());
 
     if (typeMetric == AMBIENT_LOCATION_TYPE_HUMIDITY) {
@@ -292,7 +268,7 @@ static bool s_get_cache_value(AmbientLocation* self, std::string name, int typeM
             result.out_temperature.ttl   = int(fty_proto_ttl(sensor_value));
         }
     }
-
+    fty_proto_destroy(&sensor_value);
     return true;
 }
 
@@ -305,8 +281,8 @@ static ambient_values_t s_compute_values(AmbientLocation* self, std::string name
 
     // if name is a sensor, both humidity and temperature will see it
     // as it is even if we don't have data in both
-    if (s_get_cache_value(self, name, AMBIENT_LOCATION_TYPE_HUMIDITY, result)) {
-        s_get_cache_value(self, name, AMBIENT_LOCATION_TYPE_TEMP, result);
+    if (s_get_value(self, name, AMBIENT_LOCATION_TYPE_HUMIDITY, result)) {
+        s_get_value(self, name, AMBIENT_LOCATION_TYPE_TEMP, result);
         return result;
     }
 
@@ -518,73 +494,7 @@ static void s_handle_actor_stream(AmbientLocation* self, zmsg_t** message_p)
         log_error("Get a stream message that is not fty_proto typed");
         return;
     }
-
-    if (streq(mlm_client_address(self->client), FTY_PROTO_STREAM_METRICS_SENSOR)) {
-        // should be a metric here
-        if (fty_proto_id(bmsg) != FTY_PROTO_METRIC) {
-            log_debug("Get a stream message that is not a metric");
-            fty_proto_destroy(&bmsg);
-            return;
-        }
-
-        // get sensor name
-        std::string sensor_name = fty_proto_aux_string(bmsg, "sname", "");
-        // get type
-        auto s_type = fty_proto_type(bmsg);
-        if (!s_type) {
-            fty_proto_destroy(&bmsg);
-            log_error("Get a stream message that has no type: %s", sensor_name.c_str());
-            return;
-        }
-        std::string type = s_type;
-
-        log_debug("METRIC SENSOR message (asset: %s, type: %s)", sensor_name.c_str(), type.c_str());
-
-        mtx_ambient_hashmap.lock();
-        bool metric_in_cache = false;
-        if (self->cache.count(sensor_name) != 0) {
-            if (type.find("humidity") != std::string::npos) {
-                s_remove_from_cache(self, sensor_name, AMBIENT_LOCATION_TYPE_HUMIDITY);
-                self->cache.at(sensor_name).second.first = fty_proto_dup(bmsg);
-                metric_in_cache = true;
-            }
-            else if (type.find("temperature") != std::string::npos) {
-                s_remove_from_cache(self, sensor_name, AMBIENT_LOCATION_TYPE_TEMP);
-                self->cache.at(sensor_name).second.second = fty_proto_dup(bmsg);
-                metric_in_cache = true;
-            }
-        }
-        mtx_ambient_hashmap.unlock();
-
-        // PQSWMBT-3723: if sensor metric is handled, publish it in shared memory.
-        // metric (or quantity) ex.: 'humidity.default@sensor-241', 'temperature.default@sensor-372'
-        if (metric_in_cache) {
-            const char* value_s = fty_proto_value(bmsg);
-            double value = 0;
-            int r = sscanf((value_s ? value_s : ""), "%lf", &value);
-            if (r != 1) {
-                log_error("parse sensor float value failed (%s/%s, value: '%s')", sensor_name, type.c_str(), value_s);
-            } else {
-                // here, sensor metric type is like 'temperature.N' or 'humidity.N'
-                // where N is the index (offset 0) related to its device owner (epdu, ups, ...).
-                // we normalize the metric quantity to 'default'.
-                std::string newType;
-                if (type.find("temperature") != std::string::npos) {
-                    newType = "temperature.default";
-                } else if (type.find("humidity") != std::string::npos) {
-                    newType = "humidity.default";
-                } else {
-                    log_debug("type '%s' not handled", type.c_str());
-                }
-                if (!newType.empty()) {
-                    std::string unit = fty_proto_unit(bmsg) ? fty_proto_unit(bmsg) : "";
-                    s_publish_value(newType, unit, sensor_name, value, int(fty_proto_ttl(bmsg)));
-                }
-            }
-        }
-        // end PQSWMBT-3723
-    }
-    else if (fty_proto_id(bmsg) == FTY_PROTO_ASSET) {
+    if (fty_proto_id(bmsg) == FTY_PROTO_ASSET) {
         if (streq(fty_proto_aux_string(bmsg, FTY_PROTO_ASSET_TYPE, ""), "device")
             && !streq(fty_proto_aux_string(bmsg, FTY_PROTO_ASSET_SUBTYPE, ""), "sensor")
         ){
@@ -625,16 +535,14 @@ static void s_handle_actor_stream(AmbientLocation* self, zmsg_t** message_p)
                     auto sensor = self->cache.find(name);
                     if (sensor != self->cache.end()) {
                         log_debug("update cache (%s, function: %s)", name, sensor_function);
-                        sensor->second.first = sensor_function;
+                        sensor->second = sensor_function;
                     }
                     else {
                         log_debug("add in cache (%s, function: %s)", name, sensor_function);
                         self->cache[name]; // new entry
                         sensor = self->cache.find(name);
                         assert(sensor != self->cache.end());
-                        sensor->second.first = sensor_function;
-                        sensor->second.second.first  = nullptr;
-                        sensor->second.second.second = nullptr;
+                        sensor->second = sensor_function;
                     }
                 }
             }

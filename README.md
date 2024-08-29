@@ -27,7 +27,7 @@ systemctl start fty-metric-ambient-location
 ## Protocols
 
 fty-ambient-location suscribe to ASSETS stream in order to build a hierarchy of containers.
-It also suscribe to _METRICS_SENSOR  _to get the data.
+It also get metrics data (humidity and temperature) from SHM.
 
 It will publish calculated metrics on shm.
 Example of metrics name : average.humidity-input@rack-32

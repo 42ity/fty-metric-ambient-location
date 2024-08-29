@@ -6,6 +6,33 @@
 //  --------------------------------------------------------------------------
 //  Self test of this class
 
+// publish metrics
+auto publishOnShm = [](const std::string& name, const std::string& type, const std::string& value, const std::string& unit) {
+
+    fty_proto_t* n_met = fty_proto_new(FTY_PROTO_METRIC);
+    REQUIRE(n_met);
+
+    int ttl = 60;
+    fty_proto_set_name(n_met, name.c_str());
+    fty_proto_set_type(n_met, type.c_str());
+    fty_proto_set_value(n_met, "%s", value.c_str());
+    fty_proto_set_unit(n_met, "%s", unit.c_str());
+    fty_proto_set_ttl(n_met, uint32_t(ttl));
+    fty_proto_set_time(n_met, uint64_t(std::time(nullptr)));
+
+    char* aux_log = NULL;
+    asprintf(&aux_log, "%s@%s (value: %s%s, ttl: %u)",
+        fty_proto_type(n_met), fty_proto_name(n_met),
+        fty_proto_value(n_met), fty_proto_unit(n_met),
+        fty_proto_ttl(n_met));
+
+    int rv = fty::shm::write_metric(n_met);
+    REQUIRE(rv == 0);
+    zstr_free(&aux_log);
+    fty_proto_destroy(&n_met);
+};
+
+
 TEST_CASE("ambient location server test")
 {
     static const char* endpoint = "inproc://fty_metric_ambient_location_test";
@@ -21,13 +48,9 @@ TEST_CASE("ambient location server test")
     zactor_t* ambient_location = zactor_new(fty_ambient_location_server, nullptr);
 
     zstr_sendx(ambient_location, "CONNECT", endpoint, "fty-ambient-location", nullptr);
-    zstr_sendx(ambient_location, "CONSUMER", FTY_PROTO_STREAM_METRICS_SENSOR, ".*", nullptr);
     zstr_sendx(ambient_location, "CONSUMER", FTY_PROTO_STREAM_ASSETS, ".*", nullptr);
 
     sleep(1);
-    mlm_client_t* producer_m = mlm_client_new();
-    mlm_client_connect(producer_m, endpoint, 1000, "producer_m");
-    mlm_client_set_producer(producer_m, FTY_PROTO_STREAM_METRICS_SENSOR);
     mlm_client_t* producer = mlm_client_new();
     mlm_client_connect(producer, endpoint, 1000, "producer");
     mlm_client_set_producer(producer, FTY_PROTO_STREAM_ASSETS);
@@ -51,10 +74,8 @@ TEST_CASE("ambient location server test")
     int         rv      = mlm_client_send(producer, subject, &msg);
     REQUIRE(rv == 0);
 
-    if (aux)
-        zhash_destroy(&aux);
-    if (ext)
-        zhash_destroy(&ext);
+    zhash_destroy(&aux);
+    zhash_destroy(&ext);
 
     aux = zhash_new();
     zhash_autofree(aux);
@@ -73,10 +94,8 @@ TEST_CASE("ambient location server test")
     rv  = mlm_client_send(producer, subject, &msg);
     REQUIRE(rv == 0);
 
-    if (aux)
-        zhash_destroy(&aux);
-    if (ext)
-        zhash_destroy(&ext);
+    if (aux) zhash_destroy(&aux);
+    if (ext) zhash_destroy(&ext);
 
     aux = zhash_new();
     zhash_autofree(aux);
@@ -89,97 +108,90 @@ TEST_CASE("ambient location server test")
     rv  = mlm_client_send(producer, subject, &msg);
     REQUIRE(rv == 0);
 
-    if (aux)
-        zhash_destroy(&aux);
+    if (aux) zhash_destroy(&aux);
 
     sleep(1);
     zstr_sendx(ambient_location, "START", nullptr);
     sleep(1);
 
-    // publish metrics
-    aux = zhash_new();
-    zhash_autofree(aux);
-
-    zhash_insert(aux, "sname", const_cast<char*>("sensor-1"));
-
-    msg = fty_proto_encode_metric(aux, uint64_t(time(nullptr)), 60, "humidity.0", "HM1", "40", "%");
-    REQUIRE(msg);
-    mlm_client_send(producer_m, "humidity.0@HM1", &msg);
-    if (aux)
-        zhash_destroy(&aux);
+    // send values for sensor-1 first
+    publishOnShm("sensor-1", "humidity.default", "40", "%");
+    publishOnShm("sensor-1", "temperature.default", "25", "C");
 
     // wait calculation
     sleep(5);
 
     fty_proto_t* m;
     {
-        fty::shm::shmMetrics resultT;
-        fty::shm::read_metrics("datacenter-1", ".*humidity", resultT);
-        m = resultT.get(0);
+        fty::shm::shmMetrics resultH;
+        fty::shm::read_metrics("datacenter-1", ".*humidity", resultH);
+        m = resultH.get(0);
         fty_proto_print(m);
         REQUIRE(m);
         CHECK(streq(fty_proto_value(m), "40.00")); // <<< 40 / 1
-        fty_shm_delete_test_dir();
-        fty_shm_set_test_dir(SELFTEST_DIR_RW);
+        m = nullptr;
+
+        fty::shm::shmMetrics resultT;
+        fty::shm::read_metrics("datacenter-1", ".*temperature", resultT);
+        m = resultT.get(0);
+        fty_proto_print(m);
+        REQUIRE(m);
+        CHECK(streq(fty_proto_value(m), "25.00")); // <<< 25 / 1
         m = nullptr;
     }
 
-    aux = zhash_new();
-    zhash_autofree(aux);
-
-    zhash_insert(aux, "sname", const_cast<char*>("sensor-2"));
-
-    msg = fty_proto_encode_metric(aux, uint64_t(time(nullptr)), 60, "humidity.0", "HM2", "100", "%");
-    REQUIRE(msg);
-    mlm_client_send(producer_m, "humidity.0@HM2", &msg);
-    if (aux)
-        zhash_destroy(&aux);
+    // send values for sensor-2 first
+    publishOnShm("sensor-2", "humidity.default", "100", "%");
+    publishOnShm("sensor-2", "temperature.default", "27", "C");
 
     // wait calculation
     sleep(5);
 
     {
-        fty::shm::shmMetrics resultT;
-        fty::shm::read_metrics("datacenter-1", ".*humidity", resultT);
-        m = resultT.get(0);
+        fty::shm::shmMetrics resultH;
+        fty::shm::read_metrics("datacenter-1", ".*humidity", resultH);
+        m = resultH.get(0);
         fty_proto_print(m);
         REQUIRE(m);
         CHECK(streq(fty_proto_value(m), "70.00")); // <<< (100 + 40) / 2
-        fty_shm_delete_test_dir();
-        fty_shm_set_test_dir(SELFTEST_DIR_RW);
+        m = nullptr;
+
+        fty::shm::shmMetrics resultT;
+        fty::shm::read_metrics("datacenter-1", ".*temperature", resultT);
+        m = resultT.get(0);
+        fty_proto_print(m);
+        REQUIRE(m);
+        CHECK(streq(fty_proto_value(m), "26.00")); // <<< (25 + 27) / 2
         m = nullptr;
     }
 
-    // send value for HM1 again
-    aux = zhash_new();
-    zhash_autofree(aux);
-
-    zhash_insert(aux, "sname", const_cast<char*>("sensor-1"));
-
-    msg = fty_proto_encode_metric(aux, uint64_t(time(nullptr)), 60, "humidity.0", "HM1", "70", "%");
-    REQUIRE(msg);
-    mlm_client_send(producer_m, "humidity.0@HM1", &msg);
-    if (aux)
-        zhash_destroy(&aux);
+    // send values for sensor-1 again
+    publishOnShm("sensor-1", "humidity.default", "70", "%");
+    publishOnShm("sensor-1", "temperature.default", "29", "C");
 
     // wait calculation
     sleep(5);
 
     {
-        fty::shm::shmMetrics resultT;
-        fty::shm::read_metrics("datacenter-1", ".*humidity", resultT);
-        m = resultT.get(0);
+        fty::shm::shmMetrics resultH;
+        fty::shm::read_metrics("datacenter-1", ".*humidity", resultH);
+        m = resultH.get(0);
         fty_proto_print(m);
         REQUIRE(m);
         CHECK(streq(fty_proto_value(m), "85.00")); // <<< (70 + 100)  / 2
-        fty_shm_delete_test_dir();
-        fty_shm_set_test_dir(SELFTEST_DIR_RW);
+        m = nullptr;
+
+        fty::shm::shmMetrics resultT;
+        fty::shm::read_metrics("datacenter-1", ".*temperature", resultT);
+        m = resultT.get(0);
+        fty_proto_print(m);
+        REQUIRE(m);
+        CHECK(streq(fty_proto_value(m), "28.00")); // <<< (27 + 29)  / 2
         m = nullptr;
     }
 
     zactor_destroy(&ambient_location);
     mlm_client_destroy(&producer);
-    mlm_client_destroy(&producer_m);
     zactor_destroy(&server);
     fty_shm_delete_test_dir();
 }

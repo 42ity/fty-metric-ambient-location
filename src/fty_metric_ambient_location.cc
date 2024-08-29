@@ -70,7 +70,6 @@ int main (int argc, char *argv [])
     }
 
     zstr_sendx (server, "CONNECT", MLM_ENDPOINT, AGENT_NAME, NULL);
-    zstr_sendx (server, "CONSUMER", FTY_PROTO_STREAM_METRICS_SENSOR, ".*", NULL);
     zstr_sendx (server, "CONSUMER", FTY_PROTO_STREAM_ASSETS, ".*", NULL);
     zstr_sendx (server, "START", NULL);
 
